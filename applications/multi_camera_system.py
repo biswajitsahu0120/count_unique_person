@@ -13,7 +13,13 @@ from datetime import datetime
 import logging
 import threading
 import queue
-from applications.advanced_counter import AdvancedPersonCounter
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from applications.simple_counter import SimplifiedPersonCounter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +27,11 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress OpenCV MJPEG warnings
+import os
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+cv2.setLogLevel(0)
 
 
 class MultiCameraSystem:
@@ -45,44 +56,107 @@ class MultiCameraSystem:
         self.frame_queues = {}
         self.stop_event = threading.Event()
 
-        # Shared embedding database for cross-camera tracking
-        self.global_embedding_db = {}
+        # Thread lock for shared database access
+        self.db_lock = threading.Lock()
 
-        # Initialize counter for each camera
+        # Shared state class to hold mutable counters
+        class SharedState:
+            def __init__(self):
+                self.unique_count = 0
+                self.next_person_id = 1
+
+        self.shared_state = SharedState()
+
+        # Create one master counter to initialize databases
+        master_counter = SimplifiedPersonCounter(
+            model_name='yolov8n.pt',
+            confidence_threshold=0.5,
+            recount_hours=24
+        )
+
+        # Get initial counts from master
+        self.shared_state.unique_count = master_counter.unique_count
+        self.shared_state.next_person_id = master_counter.next_person_id
+
+        # Initialize counter for each camera with SHARED database
         for config in camera_configs:
             cam_id = config['id']
-            counter = AdvancedPersonCounter(
+            counter = SimplifiedPersonCounter(
                 model_name='yolov8n.pt',
                 confidence_threshold=0.5,
-                recount_hours=24,
-                camera_id=cam_id
+                recount_hours=24
             )
 
-            # Share embedding database across cameras
-            counter.embedding_database = self.global_embedding_db
+            # Share the mutable database objects across all cameras
+            counter.tracked_people = master_counter.tracked_people
+            counter.image_hashes = master_counter.image_hashes
+            counter.last_capture_time = master_counter.last_capture_time
+            counter.csv_buffer = master_counter.csv_buffer
+            counter.csv_path = master_counter.csv_path
+
+            # Link to shared state for counters
+            counter.shared_state = self.shared_state
+            counter.db_lock = self.db_lock
+
+            # Set camera-specific ID for subfolder creation
+            counter.camera_id = cam_id
 
             self.counters[cam_id] = counter
             self.frame_queues[cam_id] = queue.Queue(maxsize=2)
 
-        logger.info(f"✅ Initialized {len(camera_configs)} cameras")
+        # Keep reference to master for final stats
+        self.master_counter = master_counter
+
+        logger.info(f"✅ Initialized {len(camera_configs)} cameras with shared database")
         for config in camera_configs:
             logger.info(f"   📹 {config['id']}: {config['name']}")
 
     def camera_thread(self, cam_id, source):
         """Thread function to process each camera"""
-        cap = cv2.VideoCapture(source)
         counter = self.counters[cam_id]
+        retry_count = 0
+        max_retries = 5
+        cap = None
+
+        while retry_count < max_retries and not self.stop_event.is_set():
+            logger.info(f"📡 Connecting to camera {cam_id}... (attempt {retry_count + 1}/{max_retries})")
+
+            # For IP cameras, set timeout
+            if isinstance(source, str) and (source.startswith('http') or source.startswith('rtsp')):
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
+            else:
+                cap = cv2.VideoCapture(source)
+
+            if cap.isOpened():
+                logger.info(f"✅ Camera {cam_id} connected successfully")
+                break
+            else:
+                retry_count += 1
+                logger.warning(f"⚠️ Camera {cam_id} connection failed, retrying...")
+                import time
+                time.sleep(2)
 
         if not cap.isOpened():
-            logger.error(f"❌ Failed to open camera {cam_id}")
+            logger.error(f"❌ Failed to open camera {cam_id} after {max_retries} attempts")
             return
 
         logger.info(f"🎥 Camera {cam_id} started")
+        frame_count = 0
+        error_count = 0
+        max_errors = 30  # Allow 30 consecutive errors before stopping
 
         while not self.stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
-                break
+                error_count += 1
+                if error_count >= max_errors:
+                    logger.error(f"❌ Camera {cam_id} stopped responding after {max_errors} errors")
+                    break
+                continue
+
+            error_count = 0  # Reset error count on successful read
+            frame_count += 1
 
             # Process frame
             processed_frame = counter.process_frame(frame)
@@ -92,7 +166,7 @@ class MultiCameraSystem:
                 self.frame_queues[cam_id].put(processed_frame)
 
         cap.release()
-        logger.info(f"⏹️  Camera {cam_id} stopped")
+        logger.info(f"⏹️  Camera {cam_id} stopped (processed {frame_count} frames)")
 
     def create_mosaic(self, frames_dict):
         """Create a mosaic view of all camera feeds"""
@@ -147,13 +221,15 @@ class MultiCameraSystem:
 
     def get_global_stats(self):
         """Get combined statistics across all cameras"""
-        total_unique = 0
-        total_in_frame = 0
-        total_embeddings = len(self.global_embedding_db)
+        # Use shared state for accurate global unique count
+        total_unique = self.shared_state.unique_count
 
-        for counter in self.counters.values():
-            total_unique = max(total_unique, counter.unique_count)
-            total_in_frame += counter.current_frame_people_count
+        # Sum up current people in frame across all cameras
+        total_in_frame = sum(counter.current_frame_people_count
+                            for counter in self.counters.values())
+
+        # Count stored hashes for duplicate detection
+        total_embeddings = len(self.master_counter.image_hashes)
 
         return total_unique, total_in_frame, total_embeddings
 
@@ -219,24 +295,33 @@ class MultiCameraSystem:
 
             cv2.destroyAllWindows()
 
-            # Print final statistics
-            total_unique, total_in_frame, total_embeddings = self.get_global_stats()
+            # Print final statistics using shared state
             logger.info(f"\n✅ Final Statistics:")
-            logger.info(f"   Total Unique People: {total_unique}")
-            logger.info(f"   Embeddings Stored: {total_embeddings}")
+            logger.info(f"   Total Unique People (across all cameras): {self.shared_state.unique_count}")
+            logger.info(f"   Total tracked IDs: {len(self.master_counter.tracked_people)}")
+            logger.info(f"   Images captured: {len(list(self.master_counter.captures_dir.glob('**/*.jpg')))}")
 
-            for cam_id, counter in self.counters.items():
-                logger.info(f"   {cam_id}: {counter.unique_count} people")
+            # Show which cameras contributed to detection
+            logger.info(f"\n   Camera contributions:")
+            for cam_id in self.counters.keys():
+                logger.info(f"      📹 {cam_id}: Active")
 
 
 if __name__ == "__main__":
     # Configure your cameras here
     camera_configs = [
-        {'id': 'cam_0', 'source': 0, 'name': 'Main Entrance'},
-        # Add more cameras as needed:
-        # {'id': 'cam_1', 'source': 1, 'name': 'Exit Door'},
-        # {'id': 'cam_2', 'source': 'rtsp://camera_ip/stream', 'name': 'Side Entrance'},
+        {'id': 'cam_0', 'source': 0, 'name': 'Laptop Camera'},
+        {'id': 'cam_1', 'source': 'http://root:root@192.168.1.3:8080/video', 'name': 'IP Camera'},
     ]
+
+    logger.info("=" * 60)
+    logger.info("🎥 Multi-Camera Person Counter System")
+    logger.info("=" * 60)
+    logger.info("Configured Cameras:")
+    for config in camera_configs:
+        logger.info(f"  📹 {config['name']} ({config['id']})")
+    logger.info("=" * 60)
+    logger.info("")
 
     system = MultiCameraSystem(camera_configs)
     system.run()

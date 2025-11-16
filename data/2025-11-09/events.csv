@@ -1,0 +1,4 @@
+timestamp,person_id,image_path,confidence,count_number
+2025-11-09 11:50:45,2,data/2025-11-09/captures/person_001_id_2_115045.jpg,0.93,1
+2025-11-09 12:42:31,3,data/2025-11-09/captures/person_002_id_3_124231.jpg,0.92,2
+2025-11-09 12:42:34,5,data/2025-11-09/captures/person_003_id_5_124234.jpg,0.88,3

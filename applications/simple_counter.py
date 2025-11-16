@@ -17,6 +17,10 @@ from ultralytics import YOLO
 import logging
 import hashlib
 from collections import defaultdict
+import sys
+
+# Add utilities to path for face recognition
+sys.path.append(str(Path(__file__).parent.parent / 'utilities'))
 
 # Setup logging
 logging.basicConfig(
@@ -30,7 +34,7 @@ logger = logging.getLogger(__name__)
 class SimplifiedPersonCounter:
     """Person counter with 24-hour recount window and date-organized storage"""
 
-    def __init__(self, model_name='yolov8n.pt', confidence_threshold=0.5, recount_hours=24):
+    def __init__(self, model_name='yolov8n.pt', confidence_threshold=0.5, recount_hours=24, enable_face_recognition=False, face_tolerance=0.6):
         """
         Initialize counter
 
@@ -38,6 +42,8 @@ class SimplifiedPersonCounter:
             model_name: YOLOv8 model (nano for speed)
             confidence_threshold: Detection confidence (0-1) - increased to 0.75 for fewer false positives
             recount_hours: Hours before same person can be recounted (default 24)
+            enable_face_recognition: Enable face recognition authorization (default False)
+            face_tolerance: Face match threshold for recognition (lower = stricter, default 0.6)
         """
         logger.info("🔄 Initializing Person Counter...")
 
@@ -45,6 +51,36 @@ class SimplifiedPersonCounter:
         self.confidence_threshold = confidence_threshold
         self.recount_hours = recount_hours
         self.recount_seconds = recount_hours * 3600
+
+        # Face Recognition Module (optional)
+        self.enable_face_recognition = enable_face_recognition
+        self.face_recognizer = None
+        if enable_face_recognition:
+            try:
+                # Try OpenCV-based face recognition first (no dlib dependency)
+                try:
+                    from face_recognition_opencv import FaceRecognitionAuth
+                    self.face_recognizer = FaceRecognitionAuth(
+                        known_faces_dir='known_faces',
+                        tolerance=face_tolerance,
+                        use_dnn=False  # Use Haar Cascade for speed
+                    )
+                    logger.info("✅ Face Recognition ENABLED (OpenCV)")
+                except ImportError:
+                    # Fallback to dlib-based if available
+                    from face_recognition_auth import FaceRecognitionAuth
+                    self.face_recognizer = FaceRecognitionAuth(
+                        known_faces_dir='known_faces',
+                        tolerance=face_tolerance,
+                        model='hog'
+                    )
+                    logger.info("✅ Face Recognition ENABLED (dlib)")
+
+                logger.info(f"   Known faces loaded: {len(self.face_recognizer.known_face_names)}")
+            except Exception as e:
+                logger.warning(f"⚠️  Face Recognition failed to initialize: {e}")
+                logger.warning("   Continuing without face recognition")
+                self.enable_face_recognition = False
 
         # Detection filtering thresholds - RELAXED for better detection
         self.min_bbox_area = 3000  # Minimum area: 55x55 pixels (RELAXED)
@@ -775,6 +811,33 @@ class SimplifiedPersonCounter:
             if self.stable_frame_count[track_id] < 2:
                 return None
 
+            # Face Recognition Authorization Check (if enabled)
+            if self.enable_face_recognition and self.face_recognizer:
+                # Extract person region for face recognition
+                x1, y1, x2, y2 = detection['bbox']
+                person_crop = frame[y1:y2, x1:x2]
+
+                if person_crop.size > 0:
+                    # Recognize face in person region
+                    face_recs = self.face_recognizer.recognize_faces(person_crop)
+
+                    # Check if any face is recognized and allowed
+                    if face_recs:
+                        allowed = any(rec['allowed'] for rec in face_recs)
+                        if not allowed:
+                            # Person detected but NOT ALLOWED - do not count
+                            logger.warning(f"❌ Track {track_id}: UNKNOWN PERSON - NOT ALLOWED")
+                            return None
+                        else:
+                            # Log the allowed person
+                            allowed_rec = next(rec for rec in face_recs if rec['allowed'])
+                            logger.info(f"✅ Track {track_id}: ALLOWED - {allowed_rec['name']}")
+                    else:
+                        # No face detected in person region - check configuration
+                        if hasattr(self, 'require_face_for_counting') and self.require_face_for_counting:
+                            logger.warning(f"⚠️  Track {track_id}: No face detected - not counting")
+                            return None
+
             # Only capture from key frames (non-skipped) for best quality
             if is_key_frame:
                 # Capture photo with expanded bounding box (full body)
@@ -782,23 +845,35 @@ class SimplifiedPersonCounter:
                 crop = frame[y1:y2, x1:x2]
 
                 if crop.size > 0:
+                    # Get current count (from shared state if multi-camera, else local)
+                    current_count = getattr(self, 'shared_state', self).unique_count
+
                     # Try to capture with quality check and duplicate detection
-                    image_path = self.capture_person(crop, track_id, self.unique_count + 1, min_sharpness=80.0)
+                    image_path = self.capture_person(crop, track_id, current_count + 1, min_sharpness=80.0)
 
                     # ONLY count if photo was successfully saved
                     if image_path:
-                        self.unique_count += 1
+                        # Increment counter (thread-safe if multi-camera)
+                        if hasattr(self, 'shared_state'):
+                            # Multi-camera: use shared state with lock
+                            with self.db_lock:
+                                self.shared_state.unique_count += 1
+                                count_num = self.shared_state.unique_count
+                        else:
+                            # Single camera: use local counter
+                            self.unique_count += 1
+                            count_num = self.unique_count
 
                         # Mark as counted in current window
                         self.tracked_people[track_id]['counted'] = True
-                        self.tracked_people[track_id]['count_number'] = self.unique_count
+                        self.tracked_people[track_id]['count_number'] = count_num
                         self.tracked_people[track_id]['first_count_time'] = datetime.now()
 
                         # Log the successful event
-                        self.log_event(track_id, self.unique_count, image_path, detection['confidence'])
+                        self.log_event(track_id, count_num, image_path, detection['confidence'])
 
                         # Simple clean log message
-                        logger.info(f"👤 Person #{self.unique_count} detected (ID: {track_id})")
+                        logger.info(f"👤 Person #{count_num} detected (ID: {track_id})")
                         return track_id
                     else:
                         # Photo rejected - DO NOT count, DO NOT log
@@ -834,6 +909,25 @@ class SimplifiedPersonCounter:
         """Draw a clean table with all statistics"""
         h, w = frame.shape[:2]
 
+        # Draw camera name at top right corner
+        camera_name = getattr(self, 'camera_id', 'Camera')
+        cam_text = f"📹 {camera_name.upper()}"
+
+        # Measure text size for background
+        (text_w, text_h), baseline = cv2.getTextSize(cam_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cam_x = w - text_w - 20
+        cam_y = 15
+
+        # Draw background for camera name
+        cv2.rectangle(frame, (cam_x - 10, cam_y - text_h - 5),
+                     (w - 10, cam_y + baseline + 5), (0, 100, 200), -1)
+        cv2.rectangle(frame, (cam_x - 10, cam_y - text_h - 5),
+                     (w - 10, cam_y + baseline + 5), (255, 255, 255), 2)
+
+        # Draw camera name text
+        cv2.putText(frame, cam_text, (cam_x, cam_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
         # Get density level
         density_level, density_color = self.get_density_level()
 
@@ -867,10 +961,11 @@ class SimplifiedPersonCounter:
         row_y = table_y + 55
         row_spacing = 25
 
-        # Row 1: Total Unique
+        # Row 1: Total Unique (use shared state if multi-camera)
+        display_count = getattr(self, 'shared_state', self).unique_count
         cv2.putText(frame, f"Total Unique:", (table_x + 15, row_y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(frame, f"{self.unique_count}", (table_x + 250, row_y),
+        cv2.putText(frame, f"{display_count}", (table_x + 250, row_y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         # Row 2: In Frame
@@ -982,8 +1077,29 @@ class SimplifiedPersonCounter:
             if newly_counted:
                 new_ids.add(newly_counted)
 
+        # Face Recognition (if enabled and on key frames)
+        face_recognitions = []
+        if self.enable_face_recognition and self.face_recognizer and is_key_frame:
+            face_recognitions = self.face_recognizer.recognize_faces(frame)
+
+            # Log face recognition events
+            for rec in face_recognitions:
+                # Log each recognition (throttled internally)
+                if not rec['allowed']:
+                    self.face_recognizer.log_recognition(rec, frame, save_image=True)
+                # Only log allowed faces once per session
+                elif not hasattr(self, '_logged_faces'):
+                    self._logged_faces = set()
+                if rec['allowed'] and rec['person_id'] not in self._logged_faces:
+                    self.face_recognizer.log_recognition(rec, frame, save_image=True)
+                    self._logged_faces.add(rec['person_id'])
+
         # Draw detections with stats table (all values updated now)
         frame = self.draw_detections(frame, matched, detections_list, new_ids)
+
+        # Draw face recognition results (if enabled)
+        if self.enable_face_recognition and face_recognitions:
+            frame = self.face_recognizer.draw_recognition_results(frame, face_recognitions)
 
 
         return frame
